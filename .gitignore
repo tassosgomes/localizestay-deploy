@@ -1,0 +1,20 @@
+# Nunca versionar segredos ou env files renderizados (Infisical Agent, etc.)
+*.env
+.env
+.env.*
+!*.env.example
+
+# Segredos/materiais locais que às vezes acabam nesta pasta por engano
+*.pem
+*.key
+*.crt
+secrets/
+*secret*.y*ml
+!envs/**/SECRETS.md
+
+# Artefatos de SO/editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/

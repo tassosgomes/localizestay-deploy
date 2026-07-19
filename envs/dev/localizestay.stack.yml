@@ -1,0 +1,414 @@
+# =============================================================================
+# LocalizeStay — stack Swarm de DEV (mcad-server, servidor compartilhado)
+# =============================================================================
+# Fonte única de verdade de deploy (ADR-0009), aplicada pelo Portainer GitOps.
+# Nós de referência:
+#   - ADR-0003: Swarm no servidor compartilhado; stack deve nascer parametrizada
+#     por ambiente para promoção futura à VPS dedicada sem retrabalho.
+#   - ADR-0004: Cloudflare + Traefik na borda. exposedByDefault=false;
+#     NENHUM serviço publica `ports:` no host — toda exposição é via labels
+#     Traefik na rede overlay externa `traefik-public`. TLS Full (Strict) na
+#     Cloudflare; certresolver `cloudflare-resolver` (DNS-01) já existe no
+#     Traefik do host.
+#   - ADR-0005: um Postgres por stack; backup horário via
+#     eeshugerman/postgres-backup-s3 para Cloudflare R2, com PASSPHRASE (GPG).
+#   - ADR-0009: segredos NUNCA neste repositório. Todo valor `${VAR}` abaixo é
+#     um placeholder resolvido em tempo de deploy — ver ./SECRETS.md para o
+#     mecanismo (Infisical Agent + variáveis de ambiente da stack no Portainer).
+#
+# Convenções desta stack:
+#   - `localizestay-internal`: rede overlay criada por ESTA stack (não é
+#     `external: true`) — privada ao LocalizeStay, mas SEM a flag Docker
+#     `internal: true`, porque os serviços de backup precisam de saída à
+#     internet para enviar dumps ao Cloudflare R2. Isolamento de borda é
+#     garantido por não publicar portas e por nunca anexar `postgres`/
+#     `logto-postgres` à rede `traefik-public`, não por bloqueio total de
+#     egress no nível da rede.
+#   - `traefik-public`: rede overlay PRÉ-EXISTENTE no host, gerenciada pela
+#     stack do Traefik (`external: true`). Único ponto de entrada HTTP(S).
+#   - Portas de container assumidas (Dockerfiles dos apps ainda não existem
+#     nos repos `localizestay-backend`/`localizestay-frontend` no momento
+#     desta escrita): API .NET em 8080 (`ASPNETCORE_URLS=http://+:8080`),
+#     health check de readiness em `/health/ready`; SPA do traveler servida
+#     por Nginx estático em 80. Confirmar/ajustar quando os Dockerfiles
+#     forem criados.
+# =============================================================================
+
+version: "3.8"
+
+networks:
+  localizestay-internal:
+    driver: overlay
+    # NÃO marcar como external: true — esta stack é dona da rede.
+    # NÃO marcar como internal: true — ver nota acima (egress de backup).
+  traefik-public:
+    external: true
+
+volumes:
+  localizestay-db-data:
+  logto-db-data:
+
+services:
+
+  # ---------------------------------------------------------------------
+  # API — monólito modular .NET
+  # ---------------------------------------------------------------------
+  api:
+    image: ghcr.io/tassosgomes/localizestay-api:dev
+    networks:
+      - localizestay-internal
+      - traefik-public
+    environment:
+      # -- não sensível, inline --
+      ASPNETCORE_ENVIRONMENT: "Development"
+      ASPNETCORE_URLS: "http://+:8080"
+      TZ: "America/Sao_Paulo"
+      LOGTO_ISSUER: "https://lstay-auth.tasso.dev.br/oidc"
+      LOGTO_API_RESOURCE_IDENTIFIER: "https://api.localizestay.com"
+      # -- sensível: placeholder resolvido via Infisical (ver SECRETS.md) --
+      ConnectionStrings__Default: "Host=postgres;Port=5432;Database=localizestay;Username=localizestay;Password=${LOCALIZESTAY_DB_PASSWORD}"
+      Logto__M2M__ClientId: "${LOCALIZESTAY_API_LOGTO_M2M_CLIENT_ID}"
+      Logto__M2M__ClientSecret: "${LOCALIZESTAY_API_LOGTO_M2M_CLIENT_SECRET}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      - postgres
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
+      update_config:
+        order: start-first
+        parallelism: 1
+        delay: 10s
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+        reservations:
+          cpus: "0.10"
+          memory: 256M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.docker.network=traefik-public"
+        - "traefik.http.routers.lstay-api.rule=Host(`lstay-api.tasso.dev.br`)"
+        - "traefik.http.routers.lstay-api.entrypoints=websecure"
+        - "traefik.http.routers.lstay-api.tls=true"
+        - "traefik.http.routers.lstay-api.tls.certresolver=cloudflare-resolver"
+        - "traefik.http.services.lstay-api.loadbalancer.server.port=8080"
+
+  # ---------------------------------------------------------------------
+  # Traveler — SPA React (Vite) do viajante
+  # ---------------------------------------------------------------------
+  traveler:
+    image: ghcr.io/tassosgomes/localizestay-app:dev
+    networks:
+      - traefik-public
+    environment:
+      TZ: "America/Sao_Paulo"
+      # Config pública de runtime (padrão runtime-env do localizestay-frontend):
+      # o entrypoint da imagem EXIGE as três variáveis abaixo e aborta sem elas.
+      # Não são segredos (ficam expostas no bundle do browser de qualquer forma).
+      API_URL: "https://lstay-api.tasso.dev.br"
+      AUTH_ISSUER: "https://lstay-auth.tasso.dev.br/oidc"
+      # Client ID da aplicação SPA "traveler" no LogTo — preencher após criar
+      # a aplicação (docs/setup-logto.md §3.2). Não é segredo, mas só existe
+      # após o setup do LogTo; injetado junto com as demais vars da stack.
+      AUTH_CLIENT_ID: "${LOCALIZESTAY_TRAVELER_LOGTO_CLIENT_ID}"
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
+      update_config:
+        order: start-first
+        parallelism: 1
+        delay: 10s
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.docker.network=traefik-public"
+        - "traefik.http.routers.lstay-app.rule=Host(`lstay-app.tasso.dev.br`)"
+        - "traefik.http.routers.lstay-app.entrypoints=websecure"
+        - "traefik.http.routers.lstay-app.tls=true"
+        - "traefik.http.routers.lstay-app.tls.certresolver=cloudflare-resolver"
+        # nginx-unprivileged (imagem do frontend) escuta em 8080, não 80
+        - "traefik.http.services.lstay-app.loadbalancer.server.port=8080"
+
+  # ---------------------------------------------------------------------
+  # Postgres — banco da aplicação (um Postgres por stack, ADR-0005)
+  # ---------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    networks:
+      - localizestay-internal
+    environment:
+      POSTGRES_USER: "localizestay"
+      POSTGRES_DB: "localizestay"
+      # -- sensível: placeholder Infisical --
+      POSTGRES_PASSWORD: "${LOCALIZESTAY_DB_PASSWORD}"
+      TZ: "America/Sao_Paulo"
+    volumes:
+      - localizestay-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U localizestay -d localizestay"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+      # SEM labels Traefik, SEM rede traefik-public, SEM `ports:`.
+      # Regra dura ADR-0004: postgres nunca é exposto.
+
+  # ---------------------------------------------------------------------
+  # LogTo — identidade (ADR-0006); ver docs/setup-logto.md
+  # ---------------------------------------------------------------------
+  logto:
+    # Versão FIXADA (nunca latest, ADR-0006). Estável mais recente em
+    # 2026-07-18: v1.41.0 — https://github.com/logto-io/logto/releases/tag/v1.41.0
+    image: ghcr.io/logto-io/logto:1.41.0
+    networks:
+      - localizestay-internal
+      - traefik-public
+    environment:
+      ENDPOINT: "https://lstay-auth.tasso.dev.br"
+      ADMIN_ENDPOINT: "https://lstay-logto-admin.tasso.dev.br"
+      TRUST_PROXY_HEADER: "1"
+      TZ: "America/Sao_Paulo"
+      # -- sensível: placeholder Infisical --
+      DB_URL: "postgres://logto:${LOGTO_DB_PASSWORD}@logto-postgres:5432/logto"
+    depends_on:
+      - logto-postgres
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
+      update_config:
+        order: start-first
+        parallelism: 1
+        delay: 10s
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+        reservations:
+          cpus: "0.10"
+          memory: 256M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.docker.network=traefik-public"
+        # Router público — core OIDC / experiência de login (porta 3001)
+        - "traefik.http.routers.lstay-auth.rule=Host(`lstay-auth.tasso.dev.br`)"
+        - "traefik.http.routers.lstay-auth.entrypoints=websecure"
+        - "traefik.http.routers.lstay-auth.tls=true"
+        - "traefik.http.routers.lstay-auth.tls.certresolver=cloudflare-resolver"
+        - "traefik.http.routers.lstay-auth.service=lstay-auth-core"
+        - "traefik.http.services.lstay-auth-core.loadbalancer.server.port=3001"
+        # Router restrito — Admin Console (porta 3002), somente IPs da equipe.
+        # A lista de IPs abaixo é PLACEHOLDER (bloco de exemplo TEST-NET-2,
+        # RFC 5737) — substituir pelos IPs reais da equipe antes do deploy.
+        # Depende do forwardedHeaders.trustedIPs (ranges Cloudflare) já
+        # configurado globalmente no Traefik do host (ADR-0004) para que o
+        # IP avaliado seja o CF-Connecting-IP real, não o do proxy Cloudflare.
+        - "traefik.http.middlewares.lstay-admin-ipallowlist.ipallowlist.sourcerange=198.51.100.10/32,198.51.100.11/32"
+        - "traefik.http.routers.lstay-logto-admin.rule=Host(`lstay-logto-admin.tasso.dev.br`)"
+        - "traefik.http.routers.lstay-logto-admin.entrypoints=websecure"
+        - "traefik.http.routers.lstay-logto-admin.tls=true"
+        - "traefik.http.routers.lstay-logto-admin.tls.certresolver=cloudflare-resolver"
+        - "traefik.http.routers.lstay-logto-admin.middlewares=lstay-admin-ipallowlist@swarm"
+        - "traefik.http.routers.lstay-logto-admin.service=lstay-logto-admin"
+        - "traefik.http.services.lstay-logto-admin.loadbalancer.server.port=3002"
+
+  # ---------------------------------------------------------------------
+  # LogTo Postgres — banco dedicado do LogTo (separado do banco da app)
+  # ---------------------------------------------------------------------
+  logto-postgres:
+    image: postgres:16-alpine
+    networks:
+      - localizestay-internal
+    environment:
+      POSTGRES_USER: "logto"
+      POSTGRES_DB: "logto"
+      # -- sensível: placeholder Infisical --
+      POSTGRES_PASSWORD: "${LOGTO_DB_PASSWORD}"
+      TZ: "America/Sao_Paulo"
+    volumes:
+      - logto-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U logto -d logto"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.10"
+          memory: 128M
+      # SEM labels Traefik, SEM rede traefik-public, SEM `ports:`.
+
+  # ---------------------------------------------------------------------
+  # Mailpit — SMTP de dev para o LogTo (connector de e-mail); UI restrita
+  # ---------------------------------------------------------------------
+  mailpit:
+    # Versão FIXADA (nunca latest).
+    image: axllent/mailpit:v1.30.4
+    networks:
+      - localizestay-internal
+      - traefik-public
+    environment:
+      TZ: "America/Sao_Paulo"
+      # SMTP :1025 fica só na rede interna (nenhum outro serviço externo
+      # precisa dele; logto:mailpit:1025 via DNS de serviço do Swarm).
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: 64M
+        reservations:
+          cpus: "0.02"
+          memory: 32M
+      labels:
+        - "traefik.enable=true"
+        - "traefik.docker.network=traefik-public"
+        # UI (porta 8025) atrás do mesmo ipAllowList do Admin Console do LogTo.
+        - "traefik.http.routers.lstay-mail.rule=Host(`lstay-mail.tasso.dev.br`)"
+        - "traefik.http.routers.lstay-mail.entrypoints=websecure"
+        - "traefik.http.routers.lstay-mail.tls=true"
+        - "traefik.http.routers.lstay-mail.tls.certresolver=cloudflare-resolver"
+        - "traefik.http.routers.lstay-mail.middlewares=lstay-admin-ipallowlist@swarm"
+        - "traefik.http.services.lstay-mail.loadbalancer.server.port=8025"
+        # Porta SMTP 1025 NÃO é exposta via Traefik (não é HTTP) e NÃO é
+        # publicada no host — acessível só dentro de localizestay-internal.
+
+  # ---------------------------------------------------------------------
+  # Backup — banco da aplicação → Cloudflare R2 (ADR-0005)
+  # ---------------------------------------------------------------------
+  backup-app-db:
+    image: eeshugerman/postgres-backup-s3:16
+    networks:
+      - localizestay-internal
+    environment:
+      SCHEDULE: "@hourly"
+      BACKUP_KEEP_DAYS: "30"
+      POSTGRES_HOST: "postgres"
+      POSTGRES_DATABASE: "localizestay"
+      POSTGRES_USER: "localizestay"
+      # -- sensível: placeholders Infisical --
+      POSTGRES_PASSWORD: "${LOCALIZESTAY_DB_PASSWORD}"
+      S3_REGION: "auto"
+      S3_ENDPOINT: "https://${CLOUDFLARE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+      S3_BUCKET: "localizestay-dev-backups"
+      S3_PREFIX: "postgres/app"
+      S3_S3V4: "yes"
+      S3_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID}"
+      S3_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY}"
+      PASSPHRASE: "${LOCALIZESTAY_BACKUP_PASSPHRASE}"
+    depends_on:
+      - postgres
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+      # SEM labels Traefik, SEM rede traefik-public, SEM `ports:`.
+
+  # ---------------------------------------------------------------------
+  # Backup — banco do LogTo → Cloudflare R2 (ADR-0005)
+  # ---------------------------------------------------------------------
+  backup-logto-db:
+    image: eeshugerman/postgres-backup-s3:16
+    networks:
+      - localizestay-internal
+    environment:
+      SCHEDULE: "@hourly"
+      BACKUP_KEEP_DAYS: "30"
+      POSTGRES_HOST: "logto-postgres"
+      POSTGRES_DATABASE: "logto"
+      POSTGRES_USER: "logto"
+      # -- sensível: placeholders Infisical --
+      POSTGRES_PASSWORD: "${LOGTO_DB_PASSWORD}"
+      S3_REGION: "auto"
+      S3_ENDPOINT: "https://${CLOUDFLARE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+      S3_BUCKET: "localizestay-dev-backups"
+      S3_PREFIX: "postgres/logto"
+      S3_S3V4: "yes"
+      S3_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID}"
+      S3_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY}"
+      PASSPHRASE: "${LOGTO_BACKUP_PASSPHRASE}"
+    depends_on:
+      - logto-postgres
+    deploy:
+      mode: replicated
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+      # SEM labels Traefik, SEM rede traefik-public, SEM `ports:`.

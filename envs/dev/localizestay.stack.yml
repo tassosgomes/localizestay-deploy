@@ -243,10 +243,18 @@ services:
         # IP avaliado seja o CF-Connecting-IP real, não o do proxy Cloudflare
         # — configurado em 2026-07-19 em /root/migration/stacks/traefik.compose.yml
         # (fora deste repo, componente compartilhado do mcad-server).
+        # ipstrategy.depth=1 é NECESSÁRIO além do trustedIPs acima: o
+        # trustedIPs do entrypoint só corrige o IP usado no access log; o
+        # middleware ipallowlist por si só usa RemoteAddrStrategy (IP bruto
+        # da conexão TCP, que no mcad-server aparece como um endereço
+        # 100.64.0.0/10 de NAT do provedor, não o IP real do cliente) a
+        # menos que ipstrategy.depth force a leitura do X-Forwarded-For.
+        # Confirmado via --log.level=DEBUG do Traefik em 2026-07-19.
         # IP abaixo é o do Tasso (IPv6, pode variar por não ser fixo — revisar
         # se voltar a dar Forbidden). Adicionar mais entradas (separadas por
         # vírgula) conforme mais gente da equipe precisar de acesso.
         - "traefik.http.middlewares.lstay-admin-ipallowlist.ipallowlist.sourcerange=2804:29b8:5086:268a:8d69:f467:889e:13cc/128"
+        - "traefik.http.middlewares.lstay-admin-ipallowlist.ipallowlist.ipstrategy.depth=1"
         - "traefik.http.routers.lstay-logto-admin.rule=Host(`lstay-logto-admin.tasso.dev.br`)"
         - "traefik.http.routers.lstay-logto-admin.entrypoints=websecure"
         - "traefik.http.routers.lstay-logto-admin.tls=true"

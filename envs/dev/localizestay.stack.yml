@@ -238,12 +238,15 @@ services:
         - "traefik.http.routers.lstay-auth.service=lstay-auth-core"
         - "traefik.http.services.lstay-auth-core.loadbalancer.server.port=3001"
         # Router restrito — Admin Console (porta 3002), somente IPs da equipe.
-        # A lista de IPs abaixo é PLACEHOLDER (bloco de exemplo TEST-NET-2,
-        # RFC 5737) — substituir pelos IPs reais da equipe antes do deploy.
         # Depende do forwardedHeaders.trustedIPs (ranges Cloudflare) já
         # configurado globalmente no Traefik do host (ADR-0004) para que o
-        # IP avaliado seja o CF-Connecting-IP real, não o do proxy Cloudflare.
-        - "traefik.http.middlewares.lstay-admin-ipallowlist.ipallowlist.sourcerange=198.51.100.10/32,198.51.100.11/32"
+        # IP avaliado seja o CF-Connecting-IP real, não o do proxy Cloudflare
+        # — configurado em 2026-07-19 em /root/migration/stacks/traefik.compose.yml
+        # (fora deste repo, componente compartilhado do mcad-server).
+        # IP abaixo é o do Tasso (IPv6, pode variar por não ser fixo — revisar
+        # se voltar a dar Forbidden). Adicionar mais entradas (separadas por
+        # vírgula) conforme mais gente da equipe precisar de acesso.
+        - "traefik.http.middlewares.lstay-admin-ipallowlist.ipallowlist.sourcerange=2804:29b8:5086:268a:8d69:f467:889e:13cc/128"
         - "traefik.http.routers.lstay-logto-admin.rule=Host(`lstay-logto-admin.tasso.dev.br`)"
         - "traefik.http.routers.lstay-logto-admin.entrypoints=websecure"
         - "traefik.http.routers.lstay-logto-admin.tls=true"

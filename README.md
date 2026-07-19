@@ -49,7 +49,8 @@ graph TB
     BKAPP -->|encrypted dump| R2
     BKLOGTO -->|encrypted dump| R2
 
-    IA["Infisical Agent on host"] -->|renders environment variables| Portainer["Portainer CE GitOps"]
+    IA["Infisical - projeto localizestay/dev"] -->|"UniversalAuth read-only"| SYNC["sync-infisical-to-portainer.sh - systemd timer 5min"]
+    SYNC -->|"PUT /stacks/id/git/redeploy - Env array"| Portainer["Portainer CE GitOps"]
     Portainer -->|deploys stack| SwarmNode
     Git[("localizestay-deploy - main")] -->|poll or webhook| Portainer
 ```
@@ -86,10 +87,13 @@ Traefik do host — nenhuma ação adicional de emissão manual de certificado.
    - Compose path: `envs/dev/localizestay.stack.yml`.
    - Se o repositório for privado, configurar credenciais de acesso Git no
      próprio formulário (PAT do GitHub).
-3. **Environment variables:** colar os pares `${VAR}` listados em
-   `envs/dev/SECRETS.md`, com os valores obtidos do Infisical (ver esse
-   arquivo para o mecanismo completo — a automação exata dessa etapa é
-   pendência operacional, hoje é colagem manual dos valores renderizados).
+3. **Environment variables:** os pares `${VAR}` listados em
+   `envs/dev/SECRETS.md` são preenchidos automaticamente pelo script
+   `scripts/sync-infisical-to-portainer.sh` (systemd timer no host, ver
+   `envs/dev/SECRETS.md` para o mecanismo completo e o setup único de
+   credenciais) — não é mais colagem manual. Na criação inicial da stack,
+   ainda é preciso configurar as credenciais desse script uma vez (Infisical
+   machine identity + Portainer API token) antes do primeiro sync.
 4. **GitOps updates:** habilitar. Duas opções, não mutuamente exclusivas:
    - **Polling:** Portainer verifica o repositório em um intervalo
      configurável (ex.: a cada 5 min) e reaplica a stack se o commit em
@@ -185,11 +189,20 @@ envs/
 
 - [ ] Criar os registros DNS da tabela acima na Cloudflare (proxied, TLS
       Full Strict).
-- [ ] Criar projeto/ambiente `localizestay` → `dev` no Infisical e popular
-      as variáveis listadas em `envs/dev/SECRETS.md`.
-- [ ] Definir e ligar o mecanismo exato de sincronização
-      Infisical Agent → Environment variables da stack no Portainer
-      (hoje: colagem manual).
+- [x] Confirmado em 2026-07-19: projeto/ambiente `localizestay` → `dev` no
+      Infisical populado com as 10 chaves de `envs/dev/SECRETS.md`, todas
+      com valor não-vazio.
+- [x] Machine identity dedicada no Infisical, Access Token no Portainer,
+      `scripts/sync-infisical-to-portainer.sh` rodando via timer systemd
+      no `mcad-server` (a cada 5 min) — feito em 2026-07-19. `postgres`,
+      `logto`, `logto-postgres` saudáveis desde então.
+- [ ] `api` e `traveler` seguem `0/1` — causas identificadas, não são do
+      mecanismo de segredos: `api` com health checks falhando em
+      connection strings por módulo (`operations-database`,
+      `curation-database`, etc. — a stack só define `ConnectionStrings__Default`);
+      `traveler` com `Permission denied` ao escrever `runtime-env.js`
+      (problema na imagem/Dockerfile do frontend, usuário non-root sem
+      permissão de escrita). Ambos ficam para depois.
 - [ ] Configurar a stack no Portainer (Add stack → Repository, conforme
       passo a passo acima) e criar o webhook de redeploy.
 - [ ] Registrar a URL do webhook do Portainer como secret nos repositórios
@@ -198,15 +211,27 @@ envs/
       tag imutável).
 - [ ] Configurar credencial de registry GHCR no Portainer, caso as imagens
       `ghcr.io/tassosgomes/localizestay-api`/`-app` sejam privadas.
-- [ ] Substituir os IPs placeholder (`198.51.100.10/32`,
-      `198.51.100.11/32`) do middleware `lstay-admin-ipallowlist` pelos IPs
-      reais da equipe, em `envs/dev/localizestay.stack.yml`.
+- [x] Substituir os IPs placeholder do middleware `lstay-admin-ipallowlist`
+      pelo IP real (feito em 2026-07-19, `envs/dev/localizestay.stack.yml`).
+      Adicionar mais entradas conforme mais gente da equipe precisar
+      acessar o Admin Console/Mailpit.
 - [ ] Confirmar as portas de container assumidas (`api` em 8080 com
       `/health/ready`, `traveler` em 80) quando os Dockerfiles forem
       criados em `localizestay-backend`/`localizestay-frontend` — ajustar
       os labels Traefik/healthcheck se divergirem.
-- [ ] Rodar o seed do LogTo (`npm run cli db seed -- --swe`) após o
-      primeiro deploy bem-sucedido.
-- [ ] Confirmar que o `forwardedHeaders.trustedIPs` (ranges Cloudflare) do
-      Traefik do host está atualizado — pré-condição para o `ipAllowList`
-      funcionar corretamente (ADR-0004).
+- [x] Rodar o seed do LogTo (`npm run cli db seed -- --swe`) — feito em
+      2026-07-19.
+- [x] Configurado em 2026-07-19, em `/root/migration/stacks/traefik.compose.yml`
+      no host (fora deste repo, componente compartilhado — mecad/authz/etc.
+      também se beneficiam): `forwardedHeaders.trustedIPs` (ranges
+      Cloudflare) nos entrypoints `web`/`websecure`, **e** `accesslog=true`
+      (json). Descoberta importante: isso sozinho **não** basta para o
+      `ipAllowList` funcionar — ele só corrige o IP usado no access log. O
+      middleware `ipAllowList` usa sua própria `ipStrategy` (padrão:
+      endereço bruto da conexão TCP, que no `mcad-server` aparece como um
+      IP de NAT do provedor em `100.64.0.0/10`, não o IP real do cliente).
+      É necessário também `ipallowlist.ipstrategy.depth=1` na label do
+      middleware (já aplicado em `envs/dev/localizestay.stack.yml`) para
+      forçar a leitura do IP real via `X-Forwarded-For`. Qualquer outro
+      projeto do host que use `ipAllowList` atrás do Cloudflare tem o mesmo
+      problema e precisa do mesmo `ipstrategy.depth`.
